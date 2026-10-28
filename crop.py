@@ -22,6 +22,16 @@ from facenet_pytorch import MTCNN
 from PIL import Image
 
 
+# 运行配置：执行前按服务器上的实际位置修改。
+DATA_ROOT = '/home/yicheng/CASME3/part_A/data/CASME3/part_A/data/part_A'
+ANNOTATION_PATH = os.path.join(
+    '/home/yicheng/CASME3/part_A/annotation',
+    'cas(me)3_part_A_ME_label_JpgIndex_v1.xls',
+)
+OUTPUT_ROOT = '/home/yicheng/CASME3_ME_all'
+DEVICE = 'cuda'
+
+
 def crop_safe(im, box):
     """将检测框限制在图像边界内，再返回裁剪后的图像。
 
@@ -45,137 +55,144 @@ def crop_safe(im, box):
     return im.crop((x1, y1, x2, y2))
 
 
-# 原始数据根目录和 v1 标签路径；XLS 文件由 xlrd 读取。
-path = '/home/yicheng/CASME3/part_A/data/CASME3/part_A/data/part_A'
-annotation_path = os.path.join(
-    '/home/yicheng/CASME3/part_A/annotation',
-    'cas(me)3_part_A_ME_label_JpgIndex_v1.xls',
-)
+def setup_logging(output_root):
+    """创建本次运行的终端和文件日志，返回日志器与日志路径。"""
+    # 日志逐条写入文件，方便在 SSH 终端查看，也便于运行后追溯。
+    os.makedirs(output_root, exist_ok=True)
+    log_path = os.path.join(output_root, f"crop_{datetime.now():%Y%m%d_%H%M%S_%f}.log")
+    logger = logging.Logger(__name__, level=logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    for handler in (logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8")):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger, log_path
 
-# 日志逐条写入文件，方便在 SSH 终端查看，也便于运行后追溯。
-output_root = '/home/yicheng/CASME3_ME_all'
-os.makedirs(output_root, exist_ok=True)
-log_path = os.path.join(output_root, f"crop_{datetime.now():%Y%m%d_%H%M%S_%f}.log")
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-logger.propagate = False
-formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-for handler in (logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8")):
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-logger.info("标注文件=%s；输出目录=%s；日志=%s", annotation_path, output_root, log_path)
 
-# 在 GPU 上初始化人脸检测器；下方通过 detect 获取检测框。
-mtcnn = MTCNN(keep_all=False, device="cuda")
+def main():
+    """初始化检测器和标注，执行批量裁剪，并在退出时关闭日志资源。"""
+    logger, log_path = setup_logging(OUTPUT_ROOT)
+    try:
+        logger.info("标注文件=%s；输出目录=%s；日志=%s",
+                    ANNOTATION_PATH, OUTPUT_ROOT, log_path)
+        # 在 GPU 上初始化人脸检测器；下方通过 detect 获取检测框。
+        mtcnn = MTCNN(keep_all=False, device=DEVICE)
 
-workbook = xlrd.open_workbook(annotation_path)
-sheet = workbook.sheet_by_index(0)
-num_rows = sheet.nrows
-# “成功”要求该区间所有预期帧都已保存；缺帧但完成保存的区间单独统计。
-# 帧数仅统计本次已开始处理且 onset 非零的区间，不代表目录中的历史文件数。
-stats = dict(success=0, partial=0, failed=0, skipped=0, expected=0, saved=0)
-started = 0
+        workbook = xlrd.open_workbook(ANNOTATION_PATH)
+        sheet = workbook.sheet_by_index(0)
+        num_rows = sheet.nrows
+        # “成功”要求该区间所有预期帧都已保存；缺帧但完成保存的区间单独统计。
+        # 帧数仅统计本次已开始处理且 onset 非零的区间，不代表目录中的历史文件数。
+        stats = dict(success=0, partial=0, failed=0, skipped=0, expected=0, saved=0)
+        started = 0
 
-# 第 0 行为表头；每条数据行对应一个带 onset/apex/offset 标注的区间。
-try:
-    for row_idx in range(1, num_rows):
+        # 第 0 行为表头；每条数据行对应一个带 onset/apex/offset 标注的区间。
         try:
-            started += 1
-            subject_id = session_id = "未知"
-            frame_path = ""
-            stage = "读取标注"
-            row = sheet.row_values(row_idx)
+            for row_idx in range(1, num_rows):
+                try:
+                    started += 1
+                    subject_id = session_id = "未知"
+                    frame_path = ""
+                    stage = "读取标注"
+                    row = sheet.row_values(row_idx)
 
-            # 第 1、2 列为被试和片段编号；输入目录中的片段编号转为小写。
-            subject_id = str(row[0])
-            session_id = str(row[1])
-            image_dir = os.path.join(path, subject_id, session_id.lower(), 'color')
+                    # 第 1、2 列为被试和片段编号；输入目录中的片段编号转为小写。
+                    subject_id = str(row[0])
+                    session_id = str(row[1])
+                    image_dir = os.path.join(DATA_ROOT, subject_id, session_id.lower(), 'color')
 
-            # 第 3～5 列为起始帧、峰值帧和结束帧，数值对应原始图像文件名。
-            onset = int(row[2])
-            apex = int(row[3])
-            offset = int(row[4])
-            if onset == 0:
-                stats["skipped"] += 1
-                logger.warning("跳过：onset=0；标注行=%d；被试=%s；片段=%s",
-                               row_idx + 1, subject_id, session_id)
-                continue
-            expected = offset - onset + 1
-            stats["expected"] += expected
-            saved_before = stats["saved"]
+                    # 第 3、5 列为起始帧和结束帧，数值对应原始图像文件名。
+                    onset = int(row[2])
+                    offset = int(row[4])
+                    if onset == 0:
+                        stats["skipped"] += 1
+                        logger.warning("跳过：onset=0；标注行=%d；被试=%s；片段=%s",
+                                       row_idx + 1, subject_id, session_id)
+                        continue
+                    expected = offset - onset + 1
+                    stats["expected"] += expected
+                    saved_before = stats["saved"]
 
-            # 构造闭区间 [onset, offset] 内所有预期图像路径。
-            img_path = []
-            for i in range(onset, offset + 1):
-                img_num = str(i) + '.jpg'
-                img_path.append(os.path.join(image_dir, img_num))
+                    # 构造闭区间 [onset, offset] 内所有预期图像路径。
+                    frame_paths = [
+                        os.path.join(image_dir, f"{index}.jpg")
+                        for index in range(onset, offset + 1)
+                    ]
 
-            # 参考帧仅用于检测；离开 with 后释放图像及文件资源。
-            stage = "读取 onset 图像（缺失或损坏时终止）"
-            frame_path = img_path[0]
-            with closing(Image.open(frame_path)) as img:
-                img.load()
-                img_mode = img.mode
-                stage = "检测人脸"
-                face1, _ = mtcnn.detect(img)
+                    # 参考帧仅用于检测；离开 with 后释放图像及文件资源。
+                    stage = "读取 onset 图像（缺失或损坏时终止）"
+                    frame_path = frame_paths[0]
+                    with closing(Image.open(frame_path)) as img:
+                        img.load()
+                        img_mode = img.mode
+                        stage = "检测人脸"
+                        face1, _ = mtcnn.detect(img)
 
-            if face1 is None:
-                stats["skipped"] += 1
-                logger.warning("未检测到人脸；标注行=%d；被试=%s；片段=%s；文件=%s",
-                               row_idx + 1, subject_id, session_id, frame_path)
-                continue
+                    if face1 is None:
+                        stats["skipped"] += 1
+                        logger.warning("未检测到人脸；标注行=%d；被试=%s；片段=%s；文件=%s",
+                                       row_idx + 1, subject_id, session_id, frame_path)
+                        continue
 
-            # 整段复用参考帧的第一个检测框。
-            box = face1[0]
-            stage = "创建输出目录"
-            frame_path = ""
-            output_dir = os.path.join(output_root, subject_id, session_id)
-            os.makedirs(output_dir, exist_ok=True)
+                    # 整段复用参考帧的第一个检测框。
+                    box = face1[0]
+                    stage = "创建输出目录"
+                    frame_path = ""
+                    output_dir = os.path.join(OUTPUT_ROOT, subject_id, session_id)
+                    os.makedirs(output_dir, exist_ok=True)
 
-            # 逐帧裁剪、保存并释放内存，不缓存整个区间的裁剪图。
-            # 保留从 onset 连续编号的规则；缺帧时仍可能与原编号不一致。
-            num = onset
-            for next_img_path in img_path:
-                frame_path = next_img_path
-                if not os.path.exists(next_img_path):
-                    logger.warning("缺失帧；标注行=%d；被试=%s；片段=%s；文件=%s",
-                                   row_idx + 1, subject_id, session_id, frame_path)
-                    continue
+                    # 逐帧裁剪、保存并释放内存，不缓存整个区间的裁剪图。
+                    # 保留从 onset 连续编号的规则；缺帧时仍可能与原编号不一致。
+                    num = onset
+                    for next_img_path in frame_paths:
+                        frame_path = next_img_path
+                        if not os.path.exists(next_img_path):
+                            logger.warning("缺失帧；标注行=%d；被试=%s；片段=%s；文件=%s",
+                                           row_idx + 1, subject_id, session_id, frame_path)
+                            continue
 
-                stage = "读取区间图像（损坏时终止）"
-                with closing(Image.open(next_img_path)) as next_img:
-                    next_img.load()
-                    stage = "裁剪图像"
-                    cropped = crop_safe(next_img, box)
-                    if cropped is None:
-                        raise ValueError(f"无效裁剪框：{box}")
-                    # 裁剪图和颜色转换结果也显式关闭，包括保存失败的情况。
-                    with closing(cropped):
-                        with closing(cropped.convert(img_mode)) as converted:
-                            stage = "保存图像"
-                            frame_path = os.path.join(output_dir, str(num) + '.jpg')
-                            converted.save(frame_path)
-                            stats["saved"] += 1
-                num += 1
+                        stage = "读取区间图像（损坏时终止）"
+                        with closing(Image.open(next_img_path)) as next_img:
+                            next_img.load()
+                            stage = "裁剪图像"
+                            cropped = crop_safe(next_img, box)
+                            if cropped is None:
+                                raise ValueError(f"无效裁剪框：{box}")
+                            # 裁剪图和颜色转换结果也显式关闭，包括保存失败的情况。
+                            with closing(cropped):
+                                with closing(cropped.convert(img_mode)) as converted:
+                                    stage = "保存图像"
+                                    frame_path = os.path.join(output_dir, str(num) + '.jpg')
+                                    converted.save(frame_path)
+                                    stats["saved"] += 1
+                        num += 1
 
-            saved = stats["saved"] - saved_before
-            if saved == expected:
-                stats["success"] += 1
-            else:
-                stats["partial"] += 1
-                logger.warning("区间不完整；标注行=%d；被试=%s；片段=%s；预期=%d；保存=%d",
-                               row_idx + 1, subject_id, session_id, expected, saved)
-        except Exception:
-            stats["failed"] += 1
-            logger.exception("区间失败；标注行=%d；被试=%s；片段=%s；阶段=%s；文件=%s",
-                             row_idx + 1, subject_id, session_id, stage, frame_path)
-            raise
-finally:
-    # 即使处理中断，也输出截至当前的统计；不将未处理或未完成行算作成功。
-    finished = stats["success"] + stats["partial"] + stats["failed"] + stats["skipped"]
-    logger.info("汇总：标签总数=%d；成功区间=%d；不完整区间=%d；失败区间=%d；"
-                "跳过区间=%d；未开始区间=%d；中断未完成区间=%d；"
-                "已开始的非零 onset 区间预期帧数=%d；本次实际保存帧数=%d",
-                num_rows - 1, stats["success"], stats["partial"], stats["failed"],
-                stats["skipped"], num_rows - 1 - started, started - finished,
-                stats["expected"], stats["saved"])
+                    saved = stats["saved"] - saved_before
+                    if saved == expected:
+                        stats["success"] += 1
+                    else:
+                        stats["partial"] += 1
+                        logger.warning("区间不完整；标注行=%d；被试=%s；片段=%s；预期=%d；保存=%d",
+                                       row_idx + 1, subject_id, session_id, expected, saved)
+                except Exception:
+                    stats["failed"] += 1
+                    logger.exception("区间失败；标注行=%d；被试=%s；片段=%s；阶段=%s；文件=%s",
+                                     row_idx + 1, subject_id, session_id, stage, frame_path)
+                    raise
+        finally:
+            # 即使处理中断，也输出截至当前的统计；不将未处理或未完成行算作成功。
+            finished = stats["success"] + stats["partial"] + stats["failed"] + stats["skipped"]
+            logger.info("汇总：标签总数=%d；成功区间=%d；不完整区间=%d；失败区间=%d；"
+                        "跳过区间=%d；未开始区间=%d；中断未完成区间=%d；"
+                        "已开始的非零 onset 区间预期帧数=%d；本次实际保存帧数=%d",
+                        num_rows - 1, stats["success"], stats["partial"], stats["failed"],
+                        stats["skipped"], num_rows - 1 - started, started - finished,
+                        stats["expected"], stats["saved"])
+    finally:
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
+
+
+if __name__ == "__main__":
+    main()
