@@ -3,8 +3,8 @@
 处理流程：
     1. 读取 v1 XLS 标签表的第一个工作表，逐行获取被试、片段及帧区间。
     2. 在每个微表情区间的 onset 帧上使用 MTCNN 检测人脸。
-    3. 使用同一检测框裁剪 onset 到 offset 的全部可用帧（包含两个端点）。
-    4. 按「被试/片段/帧编号.jpg」的目录结构保存裁剪结果。
+    3. 使用同一检测框逐帧裁剪 onset 到 offset 的全部可用帧（包含两个端点）。
+    4. 每帧裁剪后立即保存并释放图像资源，按「被试/片段/帧编号.jpg」组织结果。
     5. 向终端和输出目录中的日志文件写入异常明细与本次运行汇总。
 
 输入目录结构：原始数据根目录/被试编号/片段编号的小写形式/color/帧编号.jpg。
@@ -14,6 +14,7 @@
 
 import logging
 import os
+from contextlib import closing
 from datetime import datetime
 
 import xlrd
@@ -109,64 +110,52 @@ try:
                 img_num = str(i) + '.jpg'
                 img_path.append(os.path.join(image_dir, img_num))
 
-
-            # onset 帧作为整段的检测参考帧；此处要求文件存在且可以正常打开。
+            # 参考帧仅用于检测；离开 with 后释放图像及文件资源。
             stage = "读取 onset 图像（缺失或损坏时终止）"
             frame_path = img_path[0]
-            img = Image.open(frame_path)
-            img.load()
-            img_format = img.format
-            img_mode = img.mode
+            with closing(Image.open(frame_path)) as img:
+                img.load()
+                img_mode = img.mode
+                stage = "检测人脸"
+                face1, _ = mtcnn.detect(img)
 
-            # detect 返回人脸框和检测概率，不直接返回裁剪图像；此处不使用概率。
-            stage = "检测人脸"
-            face1, _ = mtcnn.detect(img)
-            next_imgs = []
-            if face1 is not None:
-                # 取返回的第一个检测框，并在整个区间复用，保持裁剪区域一致。
-                box = face1[0]
-                for next_img_path in img_path:
-                    # 保留缺帧跳过行为，同时记录原始帧路径。
-                    frame_path = next_img_path
-                    if not os.path.exists(next_img_path):
-                        logger.warning("缺失帧；标注行=%d；被试=%s；片段=%s；文件=%s",
-                                       row_idx + 1, subject_id, session_id, frame_path)
-                        continue
-                    stage = "读取区间图像（损坏时终止）"
-                    next_img = Image.open(next_img_path)
-                    next_img.load()
-                    stage = "裁剪图像"
-                    cropped_img2 = crop_safe(next_img, box)
-                    if cropped_img2 is None:
-                        raise ValueError(f"无效裁剪框：{box}")
-                    # 统一为参考帧的颜色模式，并保留其 format 属性。
-                    # 最终保存的编码格式仍由下方 .jpg 文件扩展名决定。
-                    cropped_img2 = cropped_img2.convert(img_mode)
-                    cropped_img2.format = img_format
-                    next_imgs.append(cropped_img2)
-            else:
-                # 保留原有的整段跳过行为。
+            if face1 is None:
                 stats["skipped"] += 1
                 logger.warning("未检测到人脸；标注行=%d；被试=%s；片段=%s；文件=%s",
                                row_idx + 1, subject_id, session_id, frame_path)
                 continue
 
+            # 整段复用参考帧的第一个检测框。
+            box = face1[0]
             stage = "创建输出目录"
             frame_path = ""
-            # 输出目录保留标签表中的片段编号写法；同名文件保存时会被覆盖。
-            if not os.path.exists(os.path.join(output_root, subject_id, session_id)):
-                os.makedirs(os.path.join(output_root, subject_id, session_id))
+            output_dir = os.path.join(output_root, subject_id, session_id)
+            os.makedirs(output_dir, exist_ok=True)
 
-            # 从 onset 连续编号；若中途缺帧，后续输出编号将与原始编号不一致。
+            # 逐帧裁剪、保存并释放内存，不缓存整个区间的裁剪图。
+            # 保留从 onset 连续编号的规则；缺帧时仍可能与原编号不一致。
             num = onset
-            for cropped_next_img in next_imgs:
-                save_path2 = os.path.join(
-                    output_root, subject_id, session_id, str(num) + '.jpg'
-                )
-                stage = "保存图像"
-                frame_path = save_path2
-                cropped_next_img.save(save_path2)
-                stats["saved"] += 1
+            for next_img_path in img_path:
+                frame_path = next_img_path
+                if not os.path.exists(next_img_path):
+                    logger.warning("缺失帧；标注行=%d；被试=%s；片段=%s；文件=%s",
+                                   row_idx + 1, subject_id, session_id, frame_path)
+                    continue
+
+                stage = "读取区间图像（损坏时终止）"
+                with closing(Image.open(next_img_path)) as next_img:
+                    next_img.load()
+                    stage = "裁剪图像"
+                    cropped = crop_safe(next_img, box)
+                    if cropped is None:
+                        raise ValueError(f"无效裁剪框：{box}")
+                    # 裁剪图和颜色转换结果也显式关闭，包括保存失败的情况。
+                    with closing(cropped):
+                        with closing(cropped.convert(img_mode)) as converted:
+                            stage = "保存图像"
+                            frame_path = os.path.join(output_dir, str(num) + '.jpg')
+                            converted.save(frame_path)
+                            stats["saved"] += 1
                 num += 1
 
             saved = stats["saved"] - saved_before
