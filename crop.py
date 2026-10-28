@@ -8,10 +8,12 @@
     5. 向终端和输出目录中的日志文件写入异常明细与本次运行汇总。
 
 输入目录结构：原始数据根目录/被试编号/片段编号的小写形式/color/帧编号.jpg。
-输出目录结构：/home/yicheng/CASME3_ME_all/被试编号/片段编号/帧编号.jpg。
-运行前需修改下方输入、标注和输出路径，并准备可用的 CUDA 环境。
+输出目录结构：输出根目录/被试编号/片段编号/帧编号.jpg。
+通过 --data-root、--label-file、--output-dir 指定路径，默认保留原有绝对路径。
+运行前需准备可用的 CUDA 环境；标签读取方式仍为 v1 XLS。
 """
 
+import argparse
 import logging
 import os
 from contextlib import closing
@@ -22,14 +24,25 @@ from facenet_pytorch import MTCNN
 from PIL import Image
 
 
-# 运行配置：执行前按服务器上的实际位置修改。
+# 路径参数的默认值，保留原有绝对路径。
 DATA_ROOT = '/home/yicheng/CASME3/part_A/data/CASME3/part_A/data/part_A'
 ANNOTATION_PATH = os.path.join(
     '/home/yicheng/CASME3/part_A/annotation',
     'cas(me)3_part_A_ME_label_JpgIndex_v1.xls',
 )
 OUTPUT_ROOT = '/home/yicheng/CASME3_ME_all'
-DEVICE = 'cuda'
+
+
+def parse_args():
+    """解析输入数据、标签文件和输出目录的命令行参数。"""
+    parser = argparse.ArgumentParser(
+        description="根据 CASME3 Part A 标签批量裁剪人脸图像。",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--data-root", default=DATA_ROOT, help="原始图像根目录（绝对路径）")
+    parser.add_argument("--label-file", default=ANNOTATION_PATH, help="v1 XLS 标签文件（绝对路径）")
+    parser.add_argument("--output-dir", default=OUTPUT_ROOT, help="裁剪结果与日志的输出目录（绝对路径）")
+    return parser.parse_args()
 
 
 def crop_safe(im, box):
@@ -71,14 +84,17 @@ def setup_logging(output_root):
 
 def main():
     """初始化检测器和标注，执行批量裁剪，并在退出时关闭日志资源。"""
-    logger, log_path = setup_logging(OUTPUT_ROOT)
+    args = parse_args()
+    logger, log_path = setup_logging(args.output_dir)
     try:
         logger.info("标注文件=%s；输出目录=%s；日志=%s",
-                    ANNOTATION_PATH, OUTPUT_ROOT, log_path)
+                    args.label_file, args.output_dir, log_path)
+        # 固定使用当前可见的 CUDA 设备进行人脸检测。
+        DEVICE = 'cuda'
         # 在 GPU 上初始化人脸检测器；下方通过 detect 获取检测框。
         mtcnn = MTCNN(keep_all=False, device=DEVICE)
 
-        workbook = xlrd.open_workbook(ANNOTATION_PATH)
+        workbook = xlrd.open_workbook(args.label_file)
         sheet = workbook.sheet_by_index(0)
         num_rows = sheet.nrows
         # “成功”要求该区间所有预期帧都已保存；缺帧但完成保存的区间单独统计。
@@ -99,7 +115,7 @@ def main():
                     # 第 1、2 列为被试和片段编号；输入目录中的片段编号转为小写。
                     subject_id = str(row[0])
                     session_id = str(row[1])
-                    image_dir = os.path.join(DATA_ROOT, subject_id, session_id.lower(), 'color')
+                    image_dir = os.path.join(args.data_root, subject_id, session_id.lower(), 'color')
 
                     # 第 3、5 列为起始帧和结束帧，数值对应原始图像文件名。
                     onset = int(row[2])
@@ -138,7 +154,7 @@ def main():
                     box = face1[0]
                     stage = "创建输出目录"
                     frame_path = ""
-                    output_dir = os.path.join(OUTPUT_ROOT, subject_id, session_id)
+                    output_dir = os.path.join(args.output_dir, subject_id, session_id)
                     os.makedirs(output_dir, exist_ok=True)
 
                     # 逐帧裁剪、保存并释放内存，不缓存整个区间的裁剪图。
