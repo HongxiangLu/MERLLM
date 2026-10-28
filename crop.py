@@ -5,17 +5,20 @@
     2. 在每个微表情区间的 onset 帧上使用 MTCNN 检测人脸。
     3. 使用同一检测框裁剪 onset 到 offset 的全部可用帧（包含两个端点）。
     4. 按「被试/片段/帧编号.jpg」的目录结构保存裁剪结果。
+    5. 向终端和输出目录中的日志文件写入异常明细与本次运行汇总。
 
 输入目录结构：原始数据根目录/被试编号/片段编号的小写形式/color/帧编号.jpg。
 输出目录结构：/home/yicheng/CASME3_ME_all/被试编号/片段编号/帧编号.jpg。
 运行前需修改下方输入、标注和输出路径，并准备可用的 CUDA 环境。
 """
 
+import logging
+import os
+from datetime import datetime
+
 import xlrd
 from facenet_pytorch import MTCNN
 from PIL import Image
-
-import os
 
 
 def crop_safe(im, box):
@@ -27,7 +30,7 @@ def crop_safe(im, box):
 
     Returns:
         裁剪后的 PIL 图像；边界修正后宽度或高度非正时返回 None。
-        调用方应检查返回值；当前主流程尚未处理 None 的情况。
+        主流程会记录无效裁剪框并报错终止。
     """
     w, h = im.size
     # 将浮点检测坐标转换为整数，并限制在有效图像范围内。
@@ -48,76 +51,142 @@ annotation_path = os.path.join(
     'cas(me)3_part_A_ME_label_JpgIndex_v1.xls',
 )
 
+# 日志逐条写入文件，方便在 SSH 终端查看，也便于运行后追溯。
+output_root = '/home/yicheng/CASME3_ME_all'
+os.makedirs(output_root, exist_ok=True)
+log_path = os.path.join(output_root, f"crop_{datetime.now():%Y%m%d_%H%M%S_%f}.log")
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+for handler in (logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8")):
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.info("标注文件=%s；输出目录=%s；日志=%s", annotation_path, output_root, log_path)
+
 # 在 GPU 上初始化人脸检测器；下方通过 detect 获取检测框。
 mtcnn = MTCNN(keep_all=False, device="cuda")
 
 workbook = xlrd.open_workbook(annotation_path)
 sheet = workbook.sheet_by_index(0)
 num_rows = sheet.nrows
-face_info = []
-sublist = []
+# “成功”要求该区间所有预期帧都已保存；缺帧但完成保存的区间单独统计。
+# 帧数仅统计本次已开始处理且 onset 非零的区间，不代表目录中的历史文件数。
+stats = dict(success=0, partial=0, failed=0, skipped=0, expected=0, saved=0)
+started = 0
 
 # 第 0 行为表头；每条数据行对应一个带 onset/apex/offset 标注的区间。
-for row_idx in range(1, num_rows):
-    row = sheet.row_values(row_idx)
+try:
+    for row_idx in range(1, num_rows):
+        try:
+            started += 1
+            subject_id = session_id = "未知"
+            frame_path = ""
+            stage = "读取标注"
+            row = sheet.row_values(row_idx)
 
-    # 第 1、2 列为被试和片段编号；输入目录中的片段编号转为小写。
-    subject_id = str(row[0])
-    session_id = str(row[1])
-    image_dir = os.path.join(path, subject_id, session_id.lower(), 'color')
+            # 第 1、2 列为被试和片段编号；输入目录中的片段编号转为小写。
+            subject_id = str(row[0])
+            session_id = str(row[1])
+            image_dir = os.path.join(path, subject_id, session_id.lower(), 'color')
 
-    # 第 3～5 列为起始帧、峰值帧和结束帧，数值对应原始图像文件名。
-    onset = int(row[2])
-    apex = int(row[3])
-    offset = int(row[4])
-    if onset == 0:
-        continue
-
-    # 构造闭区间 [onset, offset] 内所有预期图像路径。
-    img_num = []
-    img_path = []
-    for i in range(onset, offset + 1):
-        img_num = str(i) + '.jpg'
-        img_path.append(os.path.join(image_dir, img_num))
-    img1_num = str(onset) + '.jpg'
-
-    flag = False
-
-    # onset 帧作为整段的检测参考帧；此处要求文件存在且可以正常打开。
-    img = Image.open(img_path[0])
-    img_format = img.format
-    img_mode = img.mode
-
-    # detect 返回人脸框和检测概率，不直接返回裁剪图像；此处不使用概率。
-    face1, _ = mtcnn.detect(img)
-    next_imgs = []
-    if face1 is not None:
-        # 取返回的第一个检测框，并在整个区间复用，保持裁剪区域一致。
-        box = face1[0]
-        for next_img_path in img_path:
-            # 跳过不存在的帧；当前实现不记录缺失清单。
-            if not os.path.exists(next_img_path):
+            # 第 3～5 列为起始帧、峰值帧和结束帧，数值对应原始图像文件名。
+            onset = int(row[2])
+            apex = int(row[3])
+            offset = int(row[4])
+            if onset == 0:
+                stats["skipped"] += 1
+                logger.warning("跳过：onset=0；标注行=%d；被试=%s；片段=%s",
+                               row_idx + 1, subject_id, session_id)
                 continue
-            next_img = Image.open(next_img_path)
-            cropped_img2 = crop_safe(next_img, box)
-            # 统一为参考帧的颜色模式，并保留其 format 属性。
-            # 最终保存的编码格式仍由下方 .jpg 文件扩展名决定。
-            cropped_img2 = cropped_img2.convert(img_mode)
-            cropped_img2.format = img_format
-            next_imgs.append(cropped_img2)
-    else:
-        # 参考帧没有检测到人脸时，跳过整个标注区间。
-        continue
+            expected = offset - onset + 1
+            stats["expected"] += expected
+            saved_before = stats["saved"]
 
-    # 输出目录保留标签表中的片段编号写法；同名文件保存时会被覆盖。
-    if not os.path.exists(os.path.join('/home/yicheng/CASME3_ME_all', subject_id, session_id)):
-        os.makedirs(os.path.join('/home/yicheng/CASME3_ME_all', subject_id, session_id))
+            # 构造闭区间 [onset, offset] 内所有预期图像路径。
+            img_path = []
+            for i in range(onset, offset + 1):
+                img_num = str(i) + '.jpg'
+                img_path.append(os.path.join(image_dir, img_num))
 
-    # 从 onset 连续编号；若中途缺帧，后续输出编号将与原始编号不一致。
-    num = onset
-    for cropped_next_img in next_imgs:
-        save_path2 = os.path.join(
-            '/home/yicheng/CASME3_ME_all', subject_id, session_id, str(num) + '.jpg'
-        )
-        cropped_next_img.save(save_path2)
-        num += 1
+
+            # onset 帧作为整段的检测参考帧；此处要求文件存在且可以正常打开。
+            stage = "读取 onset 图像（缺失或损坏时终止）"
+            frame_path = img_path[0]
+            img = Image.open(frame_path)
+            img.load()
+            img_format = img.format
+            img_mode = img.mode
+
+            # detect 返回人脸框和检测概率，不直接返回裁剪图像；此处不使用概率。
+            stage = "检测人脸"
+            face1, _ = mtcnn.detect(img)
+            next_imgs = []
+            if face1 is not None:
+                # 取返回的第一个检测框，并在整个区间复用，保持裁剪区域一致。
+                box = face1[0]
+                for next_img_path in img_path:
+                    # 保留缺帧跳过行为，同时记录原始帧路径。
+                    frame_path = next_img_path
+                    if not os.path.exists(next_img_path):
+                        logger.warning("缺失帧；标注行=%d；被试=%s；片段=%s；文件=%s",
+                                       row_idx + 1, subject_id, session_id, frame_path)
+                        continue
+                    stage = "读取区间图像（损坏时终止）"
+                    next_img = Image.open(next_img_path)
+                    next_img.load()
+                    stage = "裁剪图像"
+                    cropped_img2 = crop_safe(next_img, box)
+                    if cropped_img2 is None:
+                        raise ValueError(f"无效裁剪框：{box}")
+                    # 统一为参考帧的颜色模式，并保留其 format 属性。
+                    # 最终保存的编码格式仍由下方 .jpg 文件扩展名决定。
+                    cropped_img2 = cropped_img2.convert(img_mode)
+                    cropped_img2.format = img_format
+                    next_imgs.append(cropped_img2)
+            else:
+                # 保留原有的整段跳过行为。
+                stats["skipped"] += 1
+                logger.warning("未检测到人脸；标注行=%d；被试=%s；片段=%s；文件=%s",
+                               row_idx + 1, subject_id, session_id, frame_path)
+                continue
+
+            stage = "创建输出目录"
+            frame_path = ""
+            # 输出目录保留标签表中的片段编号写法；同名文件保存时会被覆盖。
+            if not os.path.exists(os.path.join(output_root, subject_id, session_id)):
+                os.makedirs(os.path.join(output_root, subject_id, session_id))
+
+            # 从 onset 连续编号；若中途缺帧，后续输出编号将与原始编号不一致。
+            num = onset
+            for cropped_next_img in next_imgs:
+                save_path2 = os.path.join(
+                    output_root, subject_id, session_id, str(num) + '.jpg'
+                )
+                stage = "保存图像"
+                frame_path = save_path2
+                cropped_next_img.save(save_path2)
+                stats["saved"] += 1
+                num += 1
+
+            saved = stats["saved"] - saved_before
+            if saved == expected:
+                stats["success"] += 1
+            else:
+                stats["partial"] += 1
+                logger.warning("区间不完整；标注行=%d；被试=%s；片段=%s；预期=%d；保存=%d",
+                               row_idx + 1, subject_id, session_id, expected, saved)
+        except Exception:
+            stats["failed"] += 1
+            logger.exception("区间失败；标注行=%d；被试=%s；片段=%s；阶段=%s；文件=%s",
+                             row_idx + 1, subject_id, session_id, stage, frame_path)
+            raise
+finally:
+    # 即使处理中断，也输出截至当前的统计；不将未处理或未完成行算作成功。
+    finished = stats["success"] + stats["partial"] + stats["failed"] + stats["skipped"]
+    logger.info("汇总：标签总数=%d；成功区间=%d；不完整区间=%d；失败区间=%d；"
+                "跳过区间=%d；未开始区间=%d；中断未完成区间=%d；"
+                "已开始的非零 onset 区间预期帧数=%d；本次实际保存帧数=%d",
+                num_rows - 1, stats["success"], stats["partial"], stats["failed"],
+                stats["skipped"], num_rows - 1 - started, started - finished,
+                stats["expected"], stats["saved"])
