@@ -98,7 +98,7 @@ def main():
         sheet = workbook.sheet_by_index(0)
         num_rows = sheet.nrows
         # “成功”要求该区间所有预期帧都已保存；缺帧但完成保存的区间单独统计。
-        # 帧数仅统计本次已开始处理且 onset 非零的区间，不代表目录中的历史文件数。
+        # 帧数仅统计本次已开始处理的区间，不代表目录中的历史文件数。
         stats = dict(success=0, partial=0, failed=0, skipped=0, expected=0, saved=0)
         started = 0
 
@@ -120,11 +120,6 @@ def main():
                     # 第 3、5 列为起始帧和结束帧，数值对应原始图像文件名。
                     onset = int(row[2])
                     offset = int(row[4])
-                    if onset == 0:
-                        stats["skipped"] += 1
-                        logger.warning("跳过：onset=0；标注行=%d；被试=%s；片段=%s",
-                                       row_idx + 1, subject_id, session_id)
-                        continue
                     expected = offset - onset + 1
                     stats["expected"] += expected
                     saved_before = stats["saved"]
@@ -198,7 +193,7 @@ def main():
             finished = stats["success"] + stats["partial"] + stats["failed"] + stats["skipped"]
             logger.info("汇总：标签总数=%d；成功区间=%d；不完整区间=%d；失败区间=%d；"
                         "跳过区间=%d；未开始区间=%d；中断未完成区间=%d；"
-                        "已开始的非零 onset 区间预期帧数=%d；本次实际保存帧数=%d",
+                        "已开始区间预期帧数=%d；本次实际保存帧数=%d",
                         num_rows - 1, stats["success"], stats["partial"], stats["failed"],
                         stats["skipped"], num_rows - 1 - started, started - finished,
                         stats["expected"], stats["saved"])
