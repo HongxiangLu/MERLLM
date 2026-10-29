@@ -1,7 +1,7 @@
 """根据 CASME3 Part A 微表情标注，批量裁剪图像中的人脸区域。
 
 处理流程：
-    1. 读取 v1 XLS 标签表的第一个工作表，逐行获取被试、片段及帧区间。
+    1. 读取 v1 XLS 标签表的第一个工作表，逐行获取被试、片段及帧区间；onset 为 0 时从第 1 帧开始。
     2. 在每个微表情区间的 onset 帧上使用 MTCNN 检测人脸。
     3. 使用同一检测框逐帧裁剪 onset 到 offset 的全部可用帧（包含两个端点）。
     4. 每帧裁剪后立即保存并释放图像资源，按「被试/片段/原始帧编号.jpg」组织结果。
@@ -120,6 +120,11 @@ def main():
                     # 第 3、5 列为起始帧和结束帧，数值对应原始图像文件名。
                     onset = int(row[2])
                     offset = int(row[4])
+                    # 原始图像没有第 0 帧时，按约定从第 1 帧开始，不修改标签文件。
+                    if onset == 0:
+                        onset = 1
+                        logger.warning("调整起始帧：onset=0，按 1 开始处理；标注行=%d；被试=%s；片段=%s",
+                                       row_idx + 1, subject_id, session_id)
                     expected = offset - onset + 1
                     stats["expected"] += expected
                     saved_before = stats["saved"]
