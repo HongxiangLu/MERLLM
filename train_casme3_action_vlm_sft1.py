@@ -1,9 +1,16 @@
-"""CASME3: full-clip native Qwen2.5-VL, AU-description -> emotion SFT.
+"""基于 Qwen2.5-VL 的 CASME3 微表情动作描述与情绪监督微调（SFT）。
 
-Standalone replacement for the uploaded two-frame LAQ/action-token script.
-Python >= 3.10; tested APIs: transformers 4.51.3, peft 0.15.2.
-Targets are natural-language action descriptions followed by the emotion.
-AU annotations are NEVER included in the inference prompt.
+处理流程：
+    1. 读取 CSV/Excel 标注，按留一被试法（LOSO）划分训练与评估数据。
+    2. 在 onset～offset 内选择原始帧号最接近均匀目标位置的裁剪图像。
+    3. 将 AU 转为英文动作描述，与三类情绪组合成监督答案。
+    4. 使用原生视频输入训练语言 LoRA，以及配置允许的视觉参数。
+    5. 生成文本并解析情绪，保存每折结果、检查点及跨折汇总。
+
+数据集提供 AU 和情绪标注，英文答案由本脚本的词典和模板生成。
+推理提示不包含真实 AU 或情绪；输入是帧图像而不是视频文件。
+本脚本保留 onset=0 跳过规则，与裁剪脚本的起始帧调整策略相互独立。
+Python >= 3.10；原脚本注明使用过的 API 版本为 transformers 4.51.3、peft 0.15.2。
 """
 import argparse
 import contextlib
@@ -29,8 +36,8 @@ from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditi
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# The original external models.Text dictionary was not attached.
-# Built-in wording; --au-description-json can supply the original dictionary.
+# 原外部 models.Text 词典未随脚本提供。
+# 默认使用下方内置描述，可通过 --au-description-json 替换为自定义词典。
 # action_units_nouns = {
 #     1: "inner brow raising", 2: "outer brow raising", 4: "brow lowering",
 #     5: "upper lid raising", 6: "cheek raising", 7: "lid tightening",
@@ -53,10 +60,10 @@ action_units_nouns = {
     7: "tightened eyelids",
     9: "wrinkled nose",
     10: "raised upper lip",
-    12: "a smile",  # pulled lip corners
+    12: "a smile",  # AU12 表示嘴角上提，此处使用简化的英文描述。
     14: "tightened lip corners",
-    15: "lowered lip corners",  # 有15不看12
-    16: "lowered lower lip",  # opening the mouth
+    15: "lowered lip corners",  # AU15 表示嘴角下拉；当前代码不据此排除 AU12。
+    16: "lowered lower lip",  # AU16 表示下唇下拉。
     17: "raised chin",
     18: "contracted lips",
     20: "stretched lips",
@@ -72,7 +79,9 @@ action_units_nouns = {
 
 
 def parse_args():
+    """解析路径、模型、训练、评估和多 GPU 调度参数，并校验参数组合。"""
     p = argparse.ArgumentParser(description=__doc__)
+    # 输入输出及基础模型：model-name 可为远程仓库 ID 或完整的本地模型目录。
     p.add_argument("--data-root", default="/home/yicheng/CASME3_ME_all/")
     p.add_argument("--label-file", default="cas(me)3_part_A_ME_label_JpgIndex_v1.xls")
     p.add_argument("--model-name", default="Qwen/Qwen2.5-VL-7B-Instruct")
@@ -80,23 +89,27 @@ def parse_args():
     p.add_argument("--output-dir", default="./checkpoints/casme3_qwen25vl_au_sft")
     p.add_argument("--loso", default="CASME3/spNO.1")
     p.add_argument("--run-all-loso", action="store_true")
+    # 视频输入：空间尺寸须为 28 的倍数，帧数须为不小于 2 的偶数。
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--num-frames", type=int, default=12)
     p.add_argument("--sampled-fps", type=float, default=2.0,
                    help="Virtual time scale of sampled frames, not the original camera FPS.")
     p.add_argument("--au-description-json", default=None)
+    # 训练预算按微批次计；有效累计批量通常为 batch-size × grad-accum-steps。
     p.add_argument("--max-train-iters", type=int, default=6000,
                    help="Number of microbatches, as in the original script; <=0 means one data pass.")
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--eval-batch-size", type=int, default=None)
     p.add_argument("--grad-accum-steps", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=4)
+    # 不同可训练模块使用不同学习率；LoRA 的 rank、alpha 和 dropout 控制适配器。
     p.add_argument("--lr-lora", type=float, default=2e-5)
     p.add_argument("--lr-vision", type=float, default=1e-5)
     p.add_argument("--lr-merger", type=float, default=5e-5)
     p.add_argument("--lora-rank", type=int, default=8)
     p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--lora-dropout", type=float, default=0.05)
+    # 显存配置会改变训练方案：4-bit 作用于语言层，视觉主体冻结不包含 merger。
     p.add_argument("--freeze-vision-encoder", action="store_true",
                    help="Freeze native vision blocks; the native merger still trains.")
     p.add_argument("--load-in-4bit", action="store_true",
@@ -105,22 +118,26 @@ def parse_args():
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--best-metric", choices=["acc", "uf1", "uar"], default="acc")
+    # 类别不平衡处理包含采样权重及回答损失权重，两者默认同时启用。
     p.add_argument("--no-balanced-sampling", dest="balanced_sampling", action="store_false")
     p.set_defaults(balanced_sampling=True)
     p.add_argument("--class-loss-power", type=float, default=1.0)
     p.add_argument("--class-token-loss-weight", type=float, default=2.0)
     p.add_argument("--adam-eps", type=float, default=1e-6)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
+    # 此开关也控制训练循环中的 OOM；诊断时可用 --no-skip-nonfinite-batches 直接报错。
     p.add_argument("--skip-nonfinite-batches", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--nan-stop-patience", type=int, default=3)
     p.add_argument("--empty-cache-every", type=int, default=0)
     p.add_argument("--log-every", type=int, default=20)
+    # 评估在完成梯度累计更新后触发；max-eval-batches=0 表示不限制评估批数。
     p.add_argument("--eval-every-iters", type=int, default=200)
     p.add_argument("--early-stop-patience", type=int, default=0)
     p.add_argument("--max-eval-batches", type=int, default=0)
     p.add_argument("--max-new-tokens", type=int, default=96)
     p.add_argument("--repetition-penalty", type=float, default=1.08)
     p.add_argument("--no-repeat-ngram-size", type=int, default=4)
+    # 多 GPU 分片的是被试折列表，每个工作进程独立训练，不合并显存。
     p.add_argument("--loso-shard-rank", type=int, default=int(os.environ.get("LOSO_SHARD_RANK", 0)))
     p.add_argument("--loso-shard-world-size", type=int, default=int(os.environ.get("LOSO_SHARD_WORLD_SIZE", 1)))
     p.add_argument("--gpu-ids", default="")
@@ -128,6 +145,7 @@ def parse_args():
     p.add_argument("--perfect-val-acc-stop", type=float, default=1.0)
     p.add_argument("--aggregate-only", action="store_true")
     p.add_argument("--save-checkpoints", action=argparse.BooleanOptionalAction, default=True)
+    # 检查点路径仅支持配合 eval-only 评估，不提供训练状态恢复。
     p.add_argument("--checkpoint-dir", default=None,
                    help="A NEW native-video checkpoint for --eval-only, not an old LAQ checkpoint.")
     p.add_argument("--eval-only", action="store_true")
@@ -151,6 +169,7 @@ def parse_args():
     return a
 
 
+# 预设的留出被试列表；不自动排除情绪筛选后无有效样本的被试。
 CASME3_LOSO = [
     "CASME3/spNO.1", "CASME3/spNO.10", "CASME3/spNO.11", "CASME3/spNO.12",
     "CASME3/spNO.13", "CASME3/spNO.138", "CASME3/spNO.139", "CASME3/spNO.14",
@@ -180,6 +199,7 @@ CASME3_LOSO = [
 
 
 def set_seed(seed):
+    """设置 Python、NumPy 和 PyTorch 随机种子，降低重复实验的随机差异。"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -188,6 +208,9 @@ def set_seed(seed):
 
 
 def label_to_emotion(label_all):
+    """将六种原始情绪映射为三类；其他标签返回 (None, None)。
+    
+    类别编号固定为 0=positive、1=surprise、2=negative。"""
     if label_all == "happy":
         return 0, "positive"
     if label_all == "surprise":
@@ -198,6 +221,10 @@ def label_to_emotion(label_all):
 
 
 def au_to_description(label_au):
+    """将 AU 标注转换为英文动作描述，作为监督答案的一部分。
+    
+    按加号拆分并提取数字，忽略词典中不存在的 AU；不保留左右侧或强度信息。
+    组合 AU1+2 和 AU25+26 使用合并描述；无已知 AU 时使用通用描述。"""
     numbers = []
     for part in str(label_au).split("+"):
         match = re.search(r"\d+", part)
@@ -222,6 +249,10 @@ def au_to_description(label_au):
 
 
 def parse_emotion_prediction(text):
+    """从生成文本中按关键词解析三类情绪，无法识别时返回 -1。
+    
+    检查优先级为 surprise、positive、negative；这是子串匹配，
+    不具备否定或多类别冲突消解能力，也不是独立的分类输出层。"""
     text = text.lower()
     if "surprise" in text or "surprised" in text:
         return 1
@@ -241,6 +272,9 @@ def parse_emotion_prediction(text):
 
 
 def build_answer_from_template(au_text, emotion, randomize=True):
+    """由动作描述和情绪构造英文监督答案。
+    
+    训练时随机选择模板；评估时固定使用第一个模板作为参考答案。"""
     templates = [
         f"The facial actions include {au_text}. Therefore, the micro-expression category is {emotion}.",
         f"Observed facial actions include {au_text}. This pattern corresponds to a {emotion} micro-expression.",
@@ -255,6 +289,11 @@ def build_answer_from_template(au_text, emotion, randomize=True):
 
 
 def compute_metrics_from_confusion(cm):
+    """从 4×4 混淆矩阵计算准确率、宏平均 F1（UF1）和宏平均召回率（UAR）。
+    
+    行是真实类别，列是预测类别，顺序为 positive、surprise、negative、unknown。
+    unknown 预测计入错误和召回率分母；真实标签仅有前三类。
+    没有真实样本的类别召回率记为 0，宏平均仍固定对三类求平均。"""
     cm = np.asarray(cm, dtype=np.float64)
     class_cm = cm[:3, :3]
     total = cm[:3, :].sum()
@@ -285,6 +324,9 @@ def compute_metrics_from_confusion(cm):
 
 
 def save_eval_result(output_dir, loso_name, checkpoint_label, result):
+    """保存一折的混淆矩阵、逐样本预测及指标摘要。
+    
+    best_validation 目录中的同名结果文件会覆盖，表示当前选中的评估结果。"""
     result_dir = os.path.join(output_dir, loso_name.replace("/", "_"), "best_validation")
     os.makedirs(result_dir, exist_ok=True)
     np.save(os.path.join(result_dir, "confusion_matrix_4x4.npy"), result["confusion_matrix"])
@@ -310,6 +352,10 @@ def save_eval_result(output_dir, loso_name, checkpoint_label, result):
 
 
 def aggregate_saved_results(output_dir):
+    """累加输出目录中各折已保存的混淆矩阵，再计算总体指标。
+    
+    这里使用目录中已有的结果，不保证所有预定折都已完成；
+    先合并混淆矩阵得到的指标与各折指标的简单平均并不等价。"""
     total_cm = np.zeros((4, 4), dtype=np.int64)
     loso_results = []
     for name in sorted(os.listdir(output_dir)):
@@ -364,12 +410,17 @@ def aggregate_saved_results(output_dir):
 
 
 def parse_gpu_ids(gpu_ids):
+    """将逗号分隔的 GPU 编号解析成列表；空字符串表示不启用显式调度。"""
     if not gpu_ids:
         return []
     return [item.strip() for item in gpu_ids.split(",") if item.strip()]
 
 
 def launch_gpu_workers(args):
+    """每张指定 GPU 启动一个独立进程，分配不同 LOSO 折并等待结束。
+    
+    这是折之间的并行，不是 DDP 或模型切分；每张卡都需容纳完整的一折模型。
+    返回 True 表示父进程已完成调度及汇总，无需继续本进程的训练流程。"""
     gpu_ids = parse_gpu_ids(args.gpu_ids)
     if len(gpu_ids) <= 1:
         return False
@@ -429,6 +480,9 @@ def launch_gpu_workers(args):
 
 
 def compute_class_weights(labels, num_classes=3, power=1.0):
+    """按类别频数的倒数构造权重，再取幂并归一化到均值为 1。
+    
+    空类别用频数 1 防止除零；power=0 时所有权重相同。"""
     counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
     safe_counts = np.maximum(counts, 1.0)
     weights = safe_counts.sum() / (num_classes * safe_counts)
@@ -438,6 +492,10 @@ def compute_class_weights(labels, num_classes=3, power=1.0):
 
 
 def build_train_sampler(dataset, args):
+    """根据迭代预算和类别权重构造训练采样器。
+    
+    指定正的 max_train_iters 时抽取“迭代数×批量大小”个样本，允许重复。
+    均衡采样始终有放回；即使预算不为正，也不保证每条样本恰好出现一次。"""
     labels = dataset.get_labels()
     if args.max_train_iters > 0:
         num_samples = args.max_train_iters * args.batch_size
@@ -456,6 +514,7 @@ def build_train_sampler(dataset, args):
 
 
 def move_to_device(inputs, device):
+    """将输入字典中的顶层张量移到指定设备，其他值原样保留。"""
     moved = {}
     for key, value in inputs.items():
         moved[key] = value.to(device) if torch.is_tensor(value) else value
@@ -463,6 +522,7 @@ def move_to_device(inputs, device):
 
 
 def find_subsequence_positions(sequence, pattern):
+    """返回序列中所有匹配子序列覆盖的位置，供情绪 token 加权使用。"""
     if not pattern or len(pattern) > len(sequence):
         return []
     matches = []
@@ -474,6 +534,7 @@ def find_subsequence_positions(sequence, pattern):
 
 
 def cleanup_cuda():
+    """触发垃圾回收并释放 CUDA 缓存中的空闲块，不释放仍被引用的张量。"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -481,6 +542,7 @@ def cleanup_cuda():
 
 
 def normalize_subject(value):
+    """将带前缀的被试名或整数编号统一为 spNO.N。"""
     text = str(value).strip()
     match = re.search(r"spNO\.(\d+)", text, flags=re.I)
     if match:
@@ -493,6 +555,22 @@ def normalize_subject(value):
 
 @lru_cache(maxsize=8192)
 def sample_clip_paths(directory, onset, offset, count):
+    """在标注闭区间内均匀设置目标位置，并选择最近的实际图像帧。
+    
+    Args:
+        directory: 直接存放裁剪图像的片段目录，不含 color 子目录。
+        onset: 起始帧编号，包含该端点。
+        offset: 结束帧编号，包含该端点。
+        count: 需要返回的帧数，允许重复选择同一图像。
+    
+    Returns:
+        按目标时间位置排列的路径元组，长度为 count。
+    
+    Raises:
+        FileNotFoundError: 目录不存在或区间内没有可用图像。
+        ValueError: 不同图像文件被解析为相同帧号。
+    
+    文件名必须保留原始帧号；本函数缓存结果，运行中修改目录不会自动刷新缓存。"""
     files = {}
     for path in Path(directory).iterdir():
         if not path.is_file() or path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp"}:
@@ -507,16 +585,24 @@ def sample_clip_paths(directory, onset, offset, count):
             files[index] = str(path)
     if not files:
         raise FileNotFoundError(f"No frames in [{onset},{offset}]: {directory}")
+    # 目标位置仍以标注帧号定义，不按“现有文件的列表位置”均分。
     indices = np.array(sorted(files))
     targets = np.linspace(onset, offset, count)
     right = np.searchsorted(indices, targets).clip(0, len(indices) - 1)
     left = (right - 1).clip(0, len(indices) - 1)
+    # 在左右候选中选最近者；等距选左侧，越界目标选端点，允许重复采样。
     nearest = np.where(abs(indices[left] - targets) <= abs(indices[right] - targets), left, right)
     return tuple(files[int(indices[i])] for i in nearest)
 
 
 class CASME3Dataset(data.Dataset):
+    """读取 CASME3 标注及裁剪图像，为一折训练或评估构造样本。
+    
+    输入是已经提取并裁剪的帧图像，不在此处解码视频或检测人脸。
+    按表格位置读取：被试、片段、onset、apex、offset、AU、客观类别、情绪；
+    apex 和客观类别不参与当前采样和目标构造。"""
     def __init__(self, data_root, label_file, phase, num_loso, image_size, num_frames=16):
+        """按留出被试划分数据，筛选标签并预先确定每条标注的采样路径。"""
         self.phase, self.image_size, self.num_frames = phase, image_size, num_frames
         df = pd.read_csv(label_file) if str(label_file).lower().endswith(".csv") else pd.read_excel(label_file)
         if df.shape[1] < 8:
@@ -528,12 +614,14 @@ class CASME3Dataset(data.Dataset):
                 continue
             try:
                 subject = normalize_subject(row.iloc[0])
+                # train 仅保留非留出被试，其他 phase 仅保留留出被试。
                 if (subject != held_out) != (phase == "train"):
                     continue
                 onset_raw, offset_raw = float(row.iloc[2]), float(row.iloc[4])
                 if not onset_raw.is_integer() or not offset_raw.is_integer():
                     raise ValueError("Non-integer onset/offset")
                 onset, offset = int(onset_raw), int(offset_raw)
+                # 保留训练侧既有筛选规则，不因裁剪侧改为从第 1 帧开始而自动改变。
                 if onset == 0:
                     continue
                 if onset < 0 or offset < onset:
@@ -545,6 +633,7 @@ class CASME3Dataset(data.Dataset):
                 clip = str(int(value)) if isinstance(value, (float, np.floating)) and float(value).is_integer() else str(value).strip()
                 clip = clip.replace("\\", "/")
                 root = Path(data_root)
+                # 兼容三种目录布局；片段目录下应直接存放裁剪图像。
                 candidates = [root / subject / clip, root / "CASME3" / subject / clip, root / clip]
                 directory = next((p for p in candidates if p.is_dir()), None)
                 if directory is None:
@@ -556,12 +645,18 @@ class CASME3Dataset(data.Dataset):
                 raise ValueError(f"Annotation row {index + 2}: {exc}") from exc
 
     def __len__(self):
+        """返回筛选后的标注样本数，不是图像总数。"""
         return len(self.samples)
 
     def get_labels(self):
+        """返回类别编号列表，供类别权重和均衡采样器使用。"""
         return [int(sample["label"]) for sample in self.samples]
 
     def __getitem__(self, idx):
+        """读取采样帧并构造监督答案。
+        
+        video 为 uint8 数组，形状是 (帧数, 高, 宽, 3)，颜色通道为 RGB。
+        此处只缩放图像，模型需要的归一化及视觉 patch 组织由 processor 完成。"""
         sample = self.samples[idx]
         frames = []
         for path in sample["paths"]:
@@ -574,6 +669,7 @@ class CASME3Dataset(data.Dataset):
 
 
 def collate_fn(batch):
+    """整理批次，视频保留为数组列表，类别标签转换为 long 张量。"""
     return dict(videos=[item["video"] for item in batch],
                 labels=torch.tensor([item["label"] for item in batch], dtype=torch.long),
                 emotions=[item["emotion"] for item in batch],
@@ -582,6 +678,7 @@ def collate_fn(batch):
 
 
 def build_instruction():
+    """构造只含任务要求的英文提示词，不包含该样本的 AU 或真实情绪。"""
     return (
         "A complete facial micro-expression clip is provided as sampled video frames. "
         "Describe the facial action. These facial actions correspond to which micro-expression? "
@@ -591,6 +688,9 @@ def build_instruction():
 
 
 def make_messages(answer=None):
+    """构造原生视频聊天消息；训练时追加答案，推理时仅保留用户消息。
+    
+    video 字段是模板占位标记；真实帧数组通过 processor 的 videos 参数传入。"""
     messages = [{"role": "user", "content": [
         {"type": "video", "video": "already_sampled_clip"},
         {"type": "text", "text": build_instruction()},
@@ -601,19 +701,33 @@ def make_messages(answer=None):
 
 
 def get_qwenvl_model(model):
+    """从 PEFT 包装中取出基础 Qwen 模型；未包装时直接返回模型。"""
     return model.get_base_model() if isinstance(model, PeftModel) else model
 
 
 def get_embedding_device(model):
+    """取得输入词嵌入所在设备，用于放置模型输入张量。"""
     return get_qwenvl_model(model).get_input_embeddings().weight.device
 
 
 def build_sft_batch(batch, processor, model, args, include_answers=True):
+    """将帧数组和聊天文本转换为模型输入及回答区间的监督标签。
+    
+    Args:
+        batch: collate_fn 返回的视频、答案、情绪和类别信息。
+        processor: Qwen 原生多模态处理器。
+        model: 用于确定输入设备的模型。
+        args: 输入帧率、类别权重和情绪 token 权重等配置。
+        include_answers: 为 False 时仅构造推理提示，不输入真实答案。
+    
+    Returns:
+        (inputs, labels, weights)。训练时 labels 和 weights 形状均为 (B, L)，
+        仅回答位置参与损失；推理时后两项为 None。B 为批量大小，L 为填充后长度。"""
     prompt = processor.apply_chat_template(make_messages(), tokenize=False, add_generation_prompt=True)
     prompts = [prompt] * len(batch["videos"])
     common = dict(videos=batch["videos"], fps=args.sampled_fps, padding=True,
                   return_tensors="pt", do_resize=False, input_data_format="channels_last")
-    # Native processor expands video placeholders BEFORE prompt lengths are measured.
+    # 先由原生处理器展开视频占位 token，再计算提示长度，避免视觉 token 数量造成边界偏移。
     prompt_inputs = processor(text=prompts, **common)
     device = get_embedding_device(model)
     if not include_answers:
@@ -622,10 +736,12 @@ def build_sft_batch(batch, processor, model, args, include_answers=True):
                                           add_generation_prompt=False) for answer in batch["answers"]]
     inputs = processor(text=texts, **common)
     ids, mask = inputs["input_ids"], inputs["attention_mask"]
+    # -100 表示忽略位置：填充、用户提示和视频占位都不作为预测目标。
     labels = torch.full_like(ids, -100)
     weights = torch.ones_like(ids, dtype=torch.float32)
     for b in range(len(texts)):
         prompt_ids = prompt_inputs["input_ids"][b][prompt_inputs["attention_mask"][b].bool()]
+        # 通过 attention_mask 去除左侧填充，比较完整文本与纯提示的 token 前缀。
         positions = mask[b].nonzero(as_tuple=True)[0]
         sequence = ids[b, positions]
         length = len(prompt_ids)
@@ -634,8 +750,9 @@ def build_sft_batch(batch, processor, model, args, include_answers=True):
         answer_positions = positions[length:]
         labels[b, answer_positions] = ids[b, answer_positions]
         weight = float(args.runtime_class_loss_weights[int(batch["labels"][b])])
+        # 回答先赋予类别权重，再对情绪词覆盖的 token 乘以额外权重。
         weights[b, answer_positions] = weight
-        # Match both bare and whitespace-prefixed class tokens (BPE tokenization differs).
+        # 同时匹配带前导空格和不带空格的情绪编码，兼容不同的子词切分结果。
         answer_ids = sequence[length:].tolist()
         class_positions = set()
         for word in (batch["emotions"][b], " " + batch["emotions"][b]):
@@ -649,10 +766,14 @@ def build_sft_batch(batch, processor, model, args, include_answers=True):
 
 
 def weighted_lm_loss(logits, labels, loss_weights):
+    """计算回答 token 的加权因果语言模型交叉熵。
+    
+    前一位置预测后一 token，因此标签向右移一位进行对齐。
+    损失按有效 token 权重总和归一化；单样本批次的统一类别权重会在分子分母抵消。"""
     valid = labels[:, 1:].ne(-100)
     if not valid.any():
         raise ValueError("No supervised answer tokens.")
-    # Supports packed answer-only logits and ordinary full-sequence logits.
+    # 兼容仅含回答位置的二维 logits，以及包含完整序列的三维 logits。
     selected = logits if logits.ndim == 2 else logits[:, :-1, :][valid]
     targets = labels[:, 1:][valid]
     weights = loss_weights[:, 1:][valid].float()
@@ -661,31 +782,39 @@ def weighted_lm_loss(logits, labels, loss_weights):
 
 
 def forward_sft_loss(model, inputs, labels, weights):
+    """仅对预测监督答案所需的隐藏状态执行词表投影，减少 logits 显存。"""
     valid = labels[:, 1:].ne(-100)
-    # Project only the hidden states that predict supervised answer tokens.
-    # Exactly the same answer CE; avoids full-vocabulary logits for video/prompt tokens.
+    # 仅投影有效回答 token 对应的前一位置隐藏状态。
+    # 保留相同的回答交叉熵目标，避免为视频和提示位置分配完整词表 logits。
     def select_answer_states(_module, values):
+        """在 LM head 前截取有效预测位置，输出形状从 (B, L, H) 变为 (N, H)。"""
         return (values[0][:, :-1, :][valid],) + values[1:]
     handle = get_qwenvl_model(model).get_output_embeddings().register_forward_pre_hook(select_answer_states)
     try:
         output = model(**inputs, use_cache=False, return_dict=True)
         return weighted_lm_loss(output.logits, labels, weights)
     finally:
-        # Generation must always use the unmodified native LM head.
+        # 无论前向是否成功，都移除钩子，确保后续生成使用完整的原生 LM head。
         handle.remove()
 
 
 def compute_dtype(args):
+    """将已解析的精度名称转换为 torch.dtype；auto 在 main 中预先解析。"""
     return {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
 
 
 def amp_context(args):
+    """创建自动混合精度上下文；FP32 模式使用空上下文。"""
     if args.precision == "fp32":
         return contextlib.nullcontext()
     return torch.autocast(device_type=torch.device(args.device).type, dtype=compute_dtype(args))
 
 
 def build_model_and_processor(args):
+    """加载基础模型和处理器，配置量化、LoRA、视觉参数及梯度检查点。
+    
+    默认训练语言注意力的 LoRA、视觉主体和 merger；冻结视觉主体时 merger 仍训练。
+    评估检查点时另行恢复适配器和视觉权重，基础模型仍从 model_name 加载。"""
     source = args.checkpoint_dir or args.model_name
     processor = AutoProcessor.from_pretrained(source, revision=args.revision)
     processor.tokenizer.padding_side = "left"
@@ -696,6 +825,7 @@ def build_model_and_processor(args):
     if args.load_in_4bit:
         if torch.device(args.device).type != "cuda":
             raise ValueError("4-bit loading requires CUDA in this script.")
+        # NF4 双重量化；显式排除视觉模块和输出头，并在加载后检查视觉模块。
         kwargs.update(device_map={"": args.device}, quantization_config=BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=compute_dtype(args), llm_int8_skip_modules=["visual", "lm_head"]))
@@ -714,15 +844,17 @@ def build_model_and_processor(args):
     visual = get_qwenvl_model(model).visual
     for p in visual.parameters():
         p.requires_grad_(not args.freeze_vision_encoder and not args.eval_only)
+    # merger 连接视觉表示与语言表示；训练模式下即使冻结视觉主体也更新它。
     for p in visual.merger.parameters():
         p.requires_grad_(not args.eval_only)
-    # Keep all saved visual weights FP32 on reload, including evaluation.
+    # 恢复视觉权重时使用 FP32，评估模式也保持这一加载规则。
     if args.checkpoint_dir:
         payload = torch.load(Path(args.checkpoint_dir) / "visual.pt", map_location="cpu", weights_only=True)
         if payload["scope"] == "full":
             visual.float().load_state_dict(payload["state_dict"], strict=True)
         else:
             visual.merger.float().load_state_dict(payload["state_dict"], strict=True)
+    # 可训练权重保持 FP32，前向计算仍可由 autocast 使用低精度。
     for p in model.parameters():
         if p.requires_grad:
             p.data = p.data.float()
@@ -735,6 +867,7 @@ def build_model_and_processor(args):
 
 
 def make_optimizer(model, args):
+    """将 LoRA、视觉 merger 和未冻结的视觉主体分组，使用各自学习率。"""
     visual = get_qwenvl_model(model).visual
     merger = [p for p in visual.merger.parameters() if p.requires_grad]
     merger_ids = {id(p) for p in merger}
@@ -748,6 +881,10 @@ def make_optimizer(model, args):
 
 
 def save_checkpoint(model, processor, args, loso_name, checkpoint_label):
+    """保存 PEFT 适配器、处理器、视觉权重和运行配置。
+    
+    不保存优化器、梯度缩放器或完整训练状态，因此不是断点续训快照；
+    重新加载时还需要原始基础模型。冻结视觉主体时仅另存 merger 权重。"""
     path = Path(args.output_dir) / loso_name.replace("/", "_") / str(checkpoint_label)
     path.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(path)
@@ -763,6 +900,11 @@ def save_checkpoint(model, processor, args, loso_name, checkpoint_label):
 
 
 def train_one_epoch(loader, model, processor, optimizer, args, eval_callback=None):
+    """执行一次 loader 遍历，包含梯度累计、周期评估和异常处理。
+    
+    loader 可由有放回采样器扩展，因此函数名中的 epoch 不一定是数据集的一遍。
+    迭代数按微批次计，优化器更新数受 grad_accum_steps 影响。
+    返回成功微批次的平均损失、停止原因和最后尝试的迭代编号。"""
     model.train()
     optimizer.zero_grad(set_to_none=True)
     scaler = torch.cuda.amp.GradScaler(enabled=torch.device(args.device).type == "cuda" and args.precision == "fp16")
@@ -782,6 +924,7 @@ def train_one_epoch(loader, model, processor, optimizer, args, eval_callback=Non
                 loss = forward_sft_loss(model, inputs, labels, weights)
             if not torch.isfinite(loss.detach()):
                 raise FloatingPointError("Nonfinite SFT loss")
+            # 按累计步数缩放损失，使多个微批次的梯度形成平均值。
             scaler.scale(loss / args.grad_accum_steps).backward()
             pending += 1
             value = loss.item()
@@ -790,7 +933,7 @@ def train_one_epoch(loader, model, processor, optimizer, args, eval_callback=Non
             did_step = pending == args.grad_accum_steps or step == total_iters
             if did_step:
                 scaler.unscale_(optimizer)
-                # Correctly average an incomplete final accumulation window.
+                # 最后一个累计窗口若不足设定步数，按实际微批次数校正梯度平均值。
                 if pending < args.grad_accum_steps:
                     for p in params:
                         if p.grad is not None:
@@ -810,6 +953,7 @@ def train_one_epoch(loader, model, processor, optimizer, args, eval_callback=Non
                 print(f"iter={step}/{total_iters} loss={total_loss/total_steps:.4f} sft={value:.4f} skipped={skipped}", flush=True)
             if args.empty_cache_every > 0 and step % args.empty_cache_every == 0:
                 cleanup_cuda()
+            # 只在优化器更新后评估，避免在未完成的累计窗口中切换训练/评估。
             if eval_callback and next_eval is not None and did_step and step >= next_eval:
                 try:
                     stop = eval_callback(step, total_loss / total_steps)
@@ -823,6 +967,7 @@ def train_one_epoch(loader, model, processor, optimizer, args, eval_callback=Non
         except (FloatingPointError, torch.OutOfMemoryError) as exc:
             if not args.skip_nonfinite_batches:
                 raise
+            # 丢弃当前累计窗口的梯度，防止异常结果污染后续参数更新。
             optimizer.zero_grad(set_to_none=True)
             pending = 0
             skipped += 1
@@ -841,6 +986,9 @@ def train_one_epoch(loader, model, processor, optimizer, args, eval_callback=Non
 
 @torch.no_grad()
 def evaluate(loader, model, processor, args, split_name="val"):
+    """在无梯度模式下生成答案，解析情绪并保存逐样本结果。
+    
+    真实答案仅用于结果对照，不传入推理提示。max_eval_batches>0 时只评估部分批次。"""
     model.eval()
     preds, targets, samples = [], [], []
     for step, batch in enumerate(loader):
@@ -853,6 +1001,7 @@ def evaluate(loader, model, processor, args, split_name="val"):
                 no_repeat_ngram_size=args.no_repeat_ngram_size,
                 pad_token_id=processor.tokenizer.pad_token_id)
         input_len = inputs["input_ids"].shape[1]
+        # generate 返回提示和续写的拼接结果，只解码新生成的答案。
         texts = processor.tokenizer.batch_decode(generated_ids[:, input_len:], skip_special_tokens=True)
         batch_preds = [parse_emotion_prediction(text) for text in texts]
         batch_targets = batch["labels"].tolist()
@@ -864,6 +1013,7 @@ def evaluate(loader, model, processor, args, split_name="val"):
                 print(f"[{split_name}] GT={gt} PRED={pred}\nGT  : {answer}\nPRED: {text}\n", flush=True)
     if not targets:
         raise ValueError("Empty evaluation set.")
+    # 无法解析的预测进入第 4 列；主指标将其计错，known_acc 仅是可解析子集指标。
     safe_preds = [pred if pred >= 0 else 3 for pred in preds]
     cm = confusion_matrix(targets, safe_preds, labels=[0, 1, 2, 3])
     metrics = compute_metrics_from_confusion(cm)
@@ -878,18 +1028,24 @@ def evaluate(loader, model, processor, args, split_name="val"):
 
 
 def seed_worker(_):
+    """根据 DataLoader 分配的 PyTorch 种子初始化子进程的 Python/NumPy 随机数。"""
     seed = torch.initial_seed() % (2**32)
     random.seed(seed)
     np.random.seed(seed)
 
 
 def run_one_loso(args, loso_name):
+    """为一个留出被试重新构建数据集和模型，完成训练或仅评估。
+    
+    当前将留出被试同时用于周期评估及最佳检查点选择，
+    所得最佳分数并非独立于模型选择的最终测试结果。"""
     set_seed(args.seed)
     train_ds = CASME3Dataset(args.data_root, args.label_file, "train", loso_name, args.image_size, args.num_frames)
     val_ds = CASME3Dataset(args.data_root, args.label_file, "test", loso_name, args.image_size, args.num_frames)
     if not len(val_ds) or (not args.eval_only and not len(train_ds)):
         raise ValueError(f"Empty LOSO split: {loso_name}; train={len(train_ds)} val={len(val_ds)}")
     print(f"Subject {loso_name}: train={len(train_ds)} val={len(val_ds)}", flush=True)
+    # 类别权重只由训练被试计算，避免使用留出被试的标签分布。
     counts, weights = compute_class_weights(train_ds.get_labels(), power=args.class_loss_power)
     args.runtime_class_loss_weights = weights.tolist()
     print("Train counts:", counts.tolist(), "class weights:", weights.tolist(), "balanced sampling:", args.balanced_sampling)
@@ -913,6 +1069,7 @@ def run_one_loso(args, loso_name):
     log_path.write_text("", encoding="utf-8")
 
     def run_eval_at_iter(global_iter, train_loss):
+        """评估当前权重，记录指标，在严格改善时保存结果并判断是否提前停止。"""
         nonlocal best_result, best_step, bad_evals, last_eval
         result = evaluate(val_loader, model, processor, args)
         last_eval = global_iter
@@ -946,6 +1103,7 @@ def run_one_loso(args, loso_name):
 
 
 def main():
+    """解析配置，选择设备，分配 LOSO 折并组织训练或结果汇总。"""
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     if args.aggregate_only:
@@ -959,7 +1117,7 @@ def main():
         args.device = "cuda:0"
     if args.checkpoint_dir:
         metadata = json.loads((Path(args.checkpoint_dir) / "run_config.json").read_text(encoding="utf-8"))
-        # Restore model/input settings while retaining current data and output paths.
+        # 从检查点恢复模型及输入设置；数据路径和输出路径仍使用本次命令行配置。
         for key in ("model_name", "revision", "num_frames", "image_size", "sampled_fps", "freeze_vision_encoder"):
             setattr(args, key, metadata["args"][key])
         args.revision = metadata.get("base_commit") or args.revision
@@ -983,6 +1141,7 @@ def main():
     loso_list = CASME3_LOSO if args.run_all_loso else ["CASME3/" + normalize_subject(args.loso)]
     if args.loso_shard_world_size < 1 or not 0 <= args.loso_shard_rank < args.loso_shard_world_size:
         raise ValueError("Invalid LOSO shard configuration.")
+    # 按步长分配不同折，每个工作进程领取互不重叠的被试子列表。
     loso_list = loso_list[args.loso_shard_rank::args.loso_shard_world_size]
     all_results = [run_one_loso(args, name) for name in loso_list]
     if not args.worker:
