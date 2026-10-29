@@ -4,7 +4,7 @@
     1. 读取 v1 XLS 标签表的第一个工作表，逐行获取被试、片段及帧区间。
     2. 在每个微表情区间的 onset 帧上使用 MTCNN 检测人脸。
     3. 使用同一检测框逐帧裁剪 onset 到 offset 的全部可用帧（包含两个端点）。
-    4. 每帧裁剪后立即保存并释放图像资源，按「被试/片段/帧编号.jpg」组织结果。
+    4. 每帧裁剪后立即保存并释放图像资源，按「被试/片段/原始帧编号.jpg」组织结果。
     5. 向终端和输出目录中的日志文件写入异常明细与本次运行汇总。
 
 输入目录结构：原始数据根目录/被试编号/片段编号的小写形式/color/帧编号.jpg。
@@ -158,8 +158,7 @@ def main():
                     os.makedirs(output_dir, exist_ok=True)
 
                     # 逐帧裁剪、保存并释放内存，不缓存整个区间的裁剪图。
-                    # 保留从 onset 连续编号的规则；缺帧时仍可能与原编号不一致。
-                    num = onset
+                    # 保留原始文件名；缺帧时保留编号空缺，确保与标注中的帧号一致。
                     for next_img_path in frame_paths:
                         frame_path = next_img_path
                         if not os.path.exists(next_img_path):
@@ -178,10 +177,9 @@ def main():
                             with closing(cropped):
                                 with closing(cropped.convert(img_mode)) as converted:
                                     stage = "保存图像"
-                                    frame_path = os.path.join(output_dir, str(num) + '.jpg')
+                                    frame_path = os.path.join(output_dir, os.path.basename(next_img_path))
                                     converted.save(frame_path)
                                     stats["saved"] += 1
-                        num += 1
 
                     saved = stats["saved"] - saved_before
                     if saved == expected:
