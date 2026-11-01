@@ -1102,6 +1102,39 @@ def run_one_loso(args, loso_name):
     return result
 
 
+def log_run_config(args, loso_list):
+    """在模型加载前输出实际运行配置，供终端及 tee 日志追溯实验。
+
+    调用前已完成检查点配置恢复、设备选择和 auto 精度解析。
+    自动收集全部命令行参数，新增参数也会进入日志；仅记录指定的环境变量。
+    每折由数据计算的类别权重仍在 run_one_loso 开头单独输出。
+    """
+    config = {
+        "arguments": vars(args),
+        "runtime": {
+            "python_executable": sys.executable,
+            "working_directory": os.getcwd(),
+            "script_path": str(Path(__file__).resolve()),
+            "pid": os.getpid(),
+            "torch_version": str(torch.__version__),
+            "torch_cuda_version": torch.version.cuda,
+            "effective_batch_size_per_fold": args.batch_size * args.grad_accum_steps,
+            "environment": {
+                name: os.environ.get(name)
+                for name in (
+                    "CUDA_VISIBLE_DEVICES", "PYTORCH_CUDA_ALLOC_CONF",
+                    "HF_HOME", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
+                )
+            },
+        },
+        "loso_subjects": loso_list,
+        "instruction": build_instruction(),
+        "au_descriptions": action_units_nouns,
+    }
+    # 一次打印完整配置并立即刷新，确保重定向日志在模型加载前收到这些信息。
+    print("运行配置（已解析）:\n" + json.dumps(config, ensure_ascii=False, indent=2), flush=True)
+
+
 def main():
     """解析配置，选择设备，分配 LOSO 折并组织训练或结果汇总。"""
     args = parse_args()
@@ -1143,6 +1176,7 @@ def main():
         raise ValueError("Invalid LOSO shard configuration.")
     # 按步长分配不同折，每个工作进程领取互不重叠的被试子列表。
     loso_list = loso_list[args.loso_shard_rank::args.loso_shard_world_size]
+    log_run_config(args, loso_list)
     all_results = [run_one_loso(args, name) for name in loso_list]
     if not args.worker:
         aggregate_saved_results(args.output_dir)
